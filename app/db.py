@@ -129,6 +129,26 @@ def get_lines(
     ).fetchall()
 
 
+def iter_batch_lines(
+    conn: sqlite3.Connection, batch_id: str, page_size: int, after_seq: int
+) -> list[sqlite3.Row]:
+    """键集分页取一批行：seq > after_seq 的至多 page_size 行，按 seq 升序。
+
+    每次调用是独立短查询（WAL 下只瞬间持有读锁），不缓存整批、不跨页持有
+    事务；调用方用完一页再取一页，下载因此与其他批次的上传提交并发进行。
+    """
+    return conn.execute(
+        """
+        SELECT seq, id, message
+        FROM lines
+        WHERE batch_id = ? AND seq > ?
+        ORDER BY seq
+        LIMIT ?
+        """,
+        (batch_id, after_seq, page_size),
+    ).fetchall()
+
+
 def committed_boundary(conn: sqlite3.Connection) -> int:
     """当前已提交批次范围的上界（batches 的最大 rowid，无批次时为 0）。
 

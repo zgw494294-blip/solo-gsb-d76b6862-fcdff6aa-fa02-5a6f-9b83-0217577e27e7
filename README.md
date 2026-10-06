@@ -60,6 +60,26 @@ docker compose up --build
 保持上传时的原始顺序，每行含 `seq`（从 1 开始）、`id`、`message`。
 未知批次 ID 返回 `404`。
 
+### `GET /batches/{batch_id}/download` — 下载整批为 gzip NDJSON 文件
+
+把已提交批次导出为**单个完整 gzip 流**（`Content-Type:
+application/gzip`，**不设置** `Content-Encoding`：gzip 是文件内容本身，
+不是传输层编码，客户端会原样落盘）。响应头附带
+`Content-Disposition: attachment; filename="batch-<batch_id>.json.gz"`，
+方便直接保存为文件。未知批次 ID 在**开始输出响应体之前**返回 `404`。
+
+解压后是 **UTF-8 NDJSON**：按批内 `seq` 升序，每行一个**仅含 `id`、
+`message`** 两个键的 JSON 对象，值与库内原文一致；引号、反斜杠、换行、
+制表符等字符按 JSON 规则正确转义；**末行也带换行符**。gzip 流含正确的
+CRC32 与 ISIZE 结束尾部（`gzip -t` 可验）。
+
+服务端逐页（键集分页）读取记录、逐行序列化并逐块压缩下发：内存中任何
+时刻只有一页记录、一行序列化字节与压缩器缓冲，**不**攒齐整批 NDJSON、
+完整 gzip 文件或完整解压内容，也**不**生成完整临时文件。下载只执行只读
+短查询（WAL 下读不阻塞写），慢下载只阻塞自己的响应协程，不阻塞另一批
+上传提交，也不阻塞已完成批次的读取。客户端中途断连时游标与连接同样
+释放；下载全程不修改批次。
+
 ### `GET /logs/search` — 按 message 检索日志
 
 在所有**已提交**批次中按 `message` 做**大小写敏感的字面子串**匹配：
@@ -136,6 +156,68 @@ curl -sS http://localhost:8000/batches
 # 按批次 ID 读行（把 BID 换成上面返回的 batch_id）
 BID=…
 curl -sS "http://localhost:8000/batches/$BID/lines?limit=10&offset=0"
+```
+
+### 下载保存、解压核对、在既有上传限额内重新上传
+
+```bash
+# 先上传一个含引号、换行、中文等字符的批次
+printf '%s\n' \
+  '{"id":"a","message":"he said \"hi\"\nnext"}' \
+  '{"id":"b","message":"世界 🌍"}' \
+  '{"id":"c","message":"plain"}' \
+  | gzip -n > batch.json.gz
+BID=$(curl -sS -X POST http://localhost:8000/batches \
+  --data-binary @batch.json.gz \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+# 1) 保存下载：-O 按服务端给的文件名保存（batch-<id>.json.gz）
+curl -sS -OJ "http://localhost:8000/batches/$BID/download"
+ls -l "batch-$BID.json.gz"
+
+# 也可显式指定保存路径
+curl -sS "http://localhost:8000/batches/$BID/download" -o downloaded.json.gz
+
+# 2) 核对响应头：application/gzip 且没有 Content-Encoding
+curl -sS -D - -o /dev/null "http://localhost:8000/batches/$BID/download"
+# Content-Type: application/gzip
+# Content-Disposition: attachment; filename="batch-<id>.json.gz"
+# （没有 Content-Encoding 头）
+
+# 3) 校验 gzip 完整性（CRC32/结束尾部），再解压核对内容
+gzip -t downloaded.json.gz && echo "gzip OK"
+gzip -dc downloaded.json.gz
+# {"id":"a","message":"he said \"hi\"\nnext"}
+# {"id":"b","message":"世界 🌍"}
+# {"id":"c","message":"plain"}
+
+# 末行带换行；每行都恰好只有 id、message 两个键
+gzip -dc downloaded.json.gz | tail -c 1 | od -An -c   # 应输出 \n
+gzip -dc downloaded.json.gz | python3 -c '
+import json,sys
+for line in sys.stdin:
+    o=json.loads(line); assert set(o)=={"id","message"}
+print("all lines valid, keys exact")'
+
+# 与库内分页读行逐值核对（seq/id/message 顺序与内容一致）
+curl -sS "http://localhost:8000/batches/$BID/lines?limit=1000" \
+  | python3 -c '
+import json,sys,gzip
+db=json.load(sys.stdin)["items"]
+dl=[json.loads(l) for l in gzip.open("downloaded.json.gz","rt",encoding="utf-8")]
+assert [(r["seq"],r["id"],r["message"]) for r in db] == \
+       [(i+1,o["id"],o["message"]) for i,o in enumerate(dl)]
+print("download matches database rows")'
+
+# 4) 在既有上传限额内重新上传下载到的文件（下载为重新压缩，体积同样
+#    受 2 MiB/8 MiB/64 KiB 限制约束；内容未超限即可直接作为新批次提交）
+curl -sS -X POST http://localhost:8000/batches \
+  --data-binary @downloaded.json.gz -H 'Content-Type: application/gzip'
+# 201 -> {"batch_id":"…（新的批次 ID）","line_count":3}
+
+# 5) 未知批次：响应开始前就是 404（不会先吐出 gzip 头再失败）
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8000/batches/deadbeef/download
 ```
 
 ### 检索日志：特殊字符、翻页间上传、重启后续页
@@ -303,8 +385,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 app/
   config.py     # 字节限制等配置
-  db.py         # SQLite 主库 + 每批次独立暂存库、原子发布
+  db.py         # SQLite 主库 + 每批次独立暂存库、原子发布、键集分页读取
   ingest.py     # 流式 gzip/NDJSON 解析器（有界内存、立即超限、整批原子）
+  download.py   # 流式 gzip NDJSON 下载器（逐页读、逐块压缩、不攒整批）
   main.py       # FastAPI 路由
   init_db.py    # 数据库初始化入口
 Dockerfile

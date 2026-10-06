@@ -8,9 +8,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import db, ingest
+from . import db, download, ingest
 from .ingest import IngestError, PayloadTooLarge
 
 # 检索查询词长度限制（字符数，空白原样保留、不计入修剪）
@@ -112,6 +112,33 @@ def get_batch_lines(
                 ],
             }
         )
+
+
+@app.get("/batches/{batch_id}/download")
+def download_batch(batch_id: str) -> StreamingResponse:
+    """把已提交批次下载为单个完整 gzip NDJSON 流。
+
+    未知批次必须在开始响应（发送响应头/任何响应体字节）之前返回 404：
+    先用短连接确认批次存在，确认后才返回 StreamingResponse。
+    成功时 Content-Type 为 application/gzip，且不设置 Content-Encoding
+    （gzip 是文件内容本身，不是传输层编码，客户端会原样保存）。
+    """
+    with db.session() as conn:
+        if db.get_batch(conn, batch_id) is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+
+    # batch_id 为 32 位十六进制（uuid4.hex），放入 Content-Disposition
+    # 无需考虑引号或非 ASCII 转义。
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="batch-{batch_id}.json.gz"'
+        )
+    }
+    return StreamingResponse(
+        download.gzip_ndjson_stream(batch_id),
+        media_type="application/gzip",
+        headers=headers,
+    )
 
 
 # --------------------------------------------------------------------------- #
