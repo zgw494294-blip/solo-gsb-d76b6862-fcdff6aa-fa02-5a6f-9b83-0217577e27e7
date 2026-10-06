@@ -660,6 +660,162 @@ def main():
     check("later uploads do not change same-range result",
           after_snap == before_snap, (before_snap, after_snap))
 
+    print("== 批次下载：gzip NDJSON 流 ==")
+    import zlib as _zlib
+
+    # 未知批次：响应开始前 404
+    r = c.get("/batches/deadbeef/download")
+    check("download unknown -> 404", r.status_code == 404, r.status_code)
+
+    # 特殊字符批次：引号、反斜杠、换行、Tab、Unicode
+    dl_recs = [
+        {"id": "d1", "message": 'he said "hi"\nnext\ttab\\end'},
+        {"id": "d2", "message": "世界 é"},
+    ]
+    r = c.post("/batches", content=gz(ndjson(dl_recs)))
+    check("download fixture -> 201", r.status_code == 201, r.text[:150])
+    dl_bid = r.json()["batch_id"]
+    # 下载按紧凑 JSON 输出；空白风格差异不影响值（上传时 JSON 空白本就不入库）
+    expected_nd = b"".join(
+        json.dumps(rec, ensure_ascii=False, separators=(",", ":")).encode()
+        + b"\n"
+        for rec in dl_recs
+    )
+
+    r = c.get(f"/batches/{dl_bid}/download")
+    check("download 200", r.status_code == 200, r.text[:150])
+    raw = r.content
+    check("download raw gzip magic", raw[:2] == b"\x1f\x8b", raw[:4].hex())
+    ctype = r.headers.get("content-type", "")
+    check("download content-type application/gzip",
+          ctype.split(";")[0].strip() == "application/gzip", ctype)
+    check("download has attachment filename",
+          f"batch-{dl_bid}.json.gz" in r.headers.get("content-disposition", ""),
+          dict(r.headers))
+    check("download no content-encoding",
+          "content-encoding" not in {k.lower() for k in r.headers},
+          dict(r.headers))
+
+    # 单个完整 gzip 流：eof 到达、CRC/ISIZE 校验通过、无尾随数据
+    dobj = _zlib.decompressobj(31)
+    try:
+        plain = dobj.decompress(raw) + dobj.flush()
+        gzip_ok = dobj.eof and dobj.unused_data == b""
+        gzip_err = ""
+    except _zlib.error as exc:
+        gzip_ok, plain, gzip_err = False, b"", str(exc)
+    check("single complete gzip stream (CRC, trailer, no trailing)",
+          gzip_ok, gzip_err)
+    check("decompressed exact NDJSON bytes", plain == expected_nd,
+          f"{plain!r} != {expected_nd!r}")
+    check("every record line ends with LF (incl. last)",
+          plain.endswith(b"\n") and plain.count(b"\n") == len(dl_recs))
+    dl_lines = plain[:-1].split(b"\n")
+    check("each line has exactly id/message with original values",
+          [json.loads(x) for x in dl_lines] == dl_recs)
+
+    # 下载产物原样重新上传：仍是合法 gzip 批次，内容逐行一致
+    r = c.post("/batches", content=raw)
+    check("re-upload downloaded bytes -> 201", r.status_code == 201, r.text[:150])
+    re_bid = r.json()["batch_id"]
+    check("re-upload line count", r.json()["line_count"] == len(dl_recs))
+    r = c.get(f"/batches/{re_bid}/lines", params={"limit": 1000})
+    check("re-uploaded content identical",
+          [(i["id"], i["message"]) for i in r.json()["items"]]
+          == [(x["id"], x["message"]) for x in dl_recs])
+    r = c.get(f"/batches/{re_bid}/download")
+    check("re-download identical bytes", r.content == raw)
+
+    # 大批次（约 1.2MiB 解压量、压缩后近 1MiB）：流式完整、行数与顺序正确
+    n_big = 3000
+    big_nd = b"".join(
+        json.dumps({"id": f"dl{i:06d}",
+                    "message": os.urandom(200).hex()}).encode() + b"\n"
+        for i in range(n_big)
+    )
+    r = c.post("/batches", content=gz(big_nd))
+    check("big download fixture -> 201", r.status_code == 201, r.text[:150])
+    big_bid = r.json()["batch_id"]
+    check("big fixture compressed <= 2MiB upload limit",
+          len(gz(big_nd)) <= 2 * 1024 * 1024)
+    r = c.get(f"/batches/{big_bid}/download")
+    check("big download 200", r.status_code == 200)
+    dobj = _zlib.decompressobj(31)
+    big_plain = dobj.decompress(r.content) + dobj.flush()
+    check("big download gzip complete", dobj.eof and dobj.unused_data == b"")
+    got_ids = [json.loads(x)["id"] for x in big_plain[:-1].split(b"\n")]
+    check("big download count & seq order",
+          len(got_ids) == n_big and got_ids == [f"dl{i:06d}" for i in range(n_big)],
+          f"{len(got_ids)} rows")
+    check("big download last line LF", big_plain.endswith(b"\n"))
+
+    print("== 批次下载：慢下载不阻塞、断连释放、下载只读 ==")
+    # 慢读下载（在独立线程里逐小块读取并暂停），期间其他上传/读取必须快速成功
+    slow_dl = {}
+    def slow_download():
+        try:
+            with httpx.Client(base_url=BASE, timeout=60) as cc:
+                with cc.stream("GET", f"/batches/{big_bid}/download") as sr:
+                    slow_dl["status"] = sr.status_code
+                    slow_dl["chunks"] = 0
+                    for _ in sr.iter_bytes(4096):
+                        slow_dl["chunks"] += 1
+                        time.sleep(0.002)
+        except Exception as exc:
+            slow_dl["error"] = repr(exc)
+
+    t = threading.Thread(target=slow_download)
+    t.start()
+    time.sleep(0.5)  # 下载进行中、服务端在逐块背压发送
+    t0 = time.time()
+    rr = c.get("/batches")
+    dl_read_ms = (time.time() - t0) * 1000
+    t0 = time.time()
+    rr2 = c.post("/batches", content=gz(ndjson(
+        [{"id": "duringdl", "message": "go"}])))
+    dl_post_ms = (time.time() - t0) * 1000
+    during_bid = rr2.json()["batch_id"]
+    t0 = time.time()
+    rr3 = c.get(f"/batches/{dl_bid}/lines", params={"limit": 1})
+    dl_lines_ms = (time.time() - t0) * 1000
+    check("list batches during slow download fast",
+          rr.status_code == 200 and dl_read_ms < 5000, f"{dl_read_ms:.0f}ms")
+    check("submit during slow download fast -> 201",
+          rr2.status_code == 201 and dl_post_ms < 5000,
+          f"{rr2.status_code} {dl_post_ms:.0f}ms")
+    check("read completed batch during slow download fast",
+          rr3.status_code == 200 and dl_lines_ms < 5000, f"{dl_lines_ms:.0f}ms")
+    t.join()
+    check("slow download streamed many chunks and finished",
+          slow_dl.get("status") == 200
+          and slow_dl.get("chunks", 0) > 50 and "error" not in slow_dl,
+          str(slow_dl))
+
+    # 客户端中途断开：再读/再写该批次都正常，说明游标与连接已释放
+    with httpx.Client(base_url=BASE, timeout=30) as cc:
+        with cc.stream("GET", f"/batches/{big_bid}/download") as sr:
+            assert sr.status_code == 200
+            next(sr.iter_bytes(4096))
+        # 退出 with 即主动断开
+    time.sleep(0.5)
+    r = c.get(f"/batches/{big_bid}/download")
+    check("full re-download after disconnect works",
+          r.status_code == 200 and r.content[:2] == b"\x1f\x8b"
+          and _zlib.decompressobj(31).decompress(r.content).count(b"\n") == n_big)
+    r = c.post("/batches", content=gz(ndjson(
+        [{"id": "afterdisc", "message": "ok"}])))
+    check("submit after disconnect -> 201", r.status_code == 201, r.text[:120])
+
+    # 下载只读：多次下载字节完全一致，批次行数不变；新提交不影响旧批次
+    r1 = c.get(f"/batches/{dl_bid}/download").content
+    r2 = c.get(f"/batches/{dl_bid}/download").content
+    check("download is read-only & deterministic", r1 == r2 == raw)
+    r = c.get(f"/batches/{dl_bid}/lines", params={"limit": 1})
+    check("downloaded batch unchanged",
+          r.status_code == 200 and r.json()["line_count"] == len(dl_recs))
+    check("during-download batch visible",
+          during_bid in list_batch_ids())
+
     print("== 暂存清理 ==")
     import glob as _glob
     leftovers = _glob.glob(
